@@ -1,0 +1,112 @@
+
+name: Frame-by-Frame HTML Video Renderer
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          python -m pip install playwright
+          python -m playwright install --with-deps chromium
+
+      - name: Render 90 individual frames
+        run: |
+          mkdir -p frames output
+          cat > render.py <<'PY'
+          import asyncio
+          from pathlib import Path
+          from playwright.async_api import async_playwright
+
+          WIDTH, HEIGHT = 1280, 720
+          FPS, DURATION = 30, 3
+          TOTAL_FRAMES = FPS * DURATION
+
+          async def main():
+              html = Path("video.html")
+              if not html.exists():
+                  raise FileNotFoundError(
+                      "Upload your animation as video.html to the repository root."
+                  )
+
+              async with async_playwright() as p:
+                  browser = await p.chromium.launch(
+                      headless=True,
+                      args=["--no-sandbox"]
+                  )
+                  page = await browser.new_page(
+                      viewport={"width": WIDTH, "height": HEIGHT},
+                      device_scale_factor=1
+                  )
+
+                  await page.goto(html.resolve().as_uri(),
+                                  wait_until="load")
+                  await page.evaluate("""
+                    async () => {
+                      await document.fonts.ready;
+                      for (const img of document.images) {
+                        if (!img.complete) {
+                          await new Promise(resolve => {
+                            img.onload = resolve;
+                            img.onerror = resolve;
+                          });
+                        }
+                      }
+                    }
+                  """)
+
+                  for frame in range(TOTAL_FRAMES):
+                      timestamp = frame / FPS
+                      await page.evaluate("""
+                        (t) => {
+                          document.getAnimations().forEach(animation => {
+                            animation.pause();
+                            animation.currentTime = t * 1000;
+                          });
+                          window.renderTime = t;
+                        }
+                      """, timestamp)
+
+                      await page.screenshot(
+                          path=f"frames/frame_{frame:04d}.png",
+                          animations="allow"
+                      )
+                      print(f"Rendered frame {frame + 1}/{TOTAL_FRAMES}")
+
+                  await browser.close()
+
+          asyncio.run(main())
+          PY
+          python render.py
+
+      - name: Combine frames into MP4
+        run: |
+          ffmpeg -y \
+            -framerate 30 \
+            -i frames/frame_%04d.png \
+            -c:v libx264 \
+            -preset veryfast \
+            -crf 23 \
+            -pix_fmt yuv420p \
+            -movflags +faststart \
+            output/video.mp4
+
+      - name: Upload MP4
+        uses: actions/upload-artifact@v4
+        with:
+          name: rendered-video-mp4
+          path: output/video.mp4
+          retention-days: 1
